@@ -4,16 +4,29 @@ import filetype
 from markitdown import MarkItDown,StreamInfo
 from pydantic import BaseModel, Field
 import io
-
-load_dotenv()
+from fastapi.concurrency import asynccontextmanager, run_in_threadpool
+import os
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
+from pymongo import AsyncMongoClient
 
+load_dotenv()
 
 mk=MarkItDown()
 
-app=FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await collection.create_index("profile.email", unique=True)
+    yield
 
+
+app=FastAPI(lifespan=lifespan, title="Resume Parser API", description="An API to parse resumes and extract structured data.", version="1.0.0")
+
+mongoo_url=os.getenv("MONGODB_URI")
+
+client = AsyncMongoClient(mongoo_url)
+db = client["resume"]
+collection = db["profiles"]
 
 class Experience(BaseModel):
     company: str|None = Field(None,description="Name of the company" , json_schema_extra={"example": "ABC Corp"})
@@ -52,7 +65,10 @@ class ResumeProfile(BaseModel):
     certifications: list[str] = Field(default_factory=list, description="Certifications mentioned in your resume")
     target_roles: list[str] = Field(default_factory=list, description="3-5 job titles this candidate is suited for, infered from experience, skills, and summary. Use canonical names for roles, e.g., 'Software Engineer', not 'SWE' or 'Software Engg'.00000")
 
-
+class UploadProfileResponse(BaseModel):
+    message: str = Field(..., description="Response message indicating the status of the upload operation")
+    document_id: str = Field(..., description="Unique identifier for the uploaded document in the database")
+    filename: str = Field(..., description="Name of the uploaded file")
 
 structured_llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash").with_structured_output(ResumeProfile)
 
@@ -105,7 +121,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.post('/uploadfile/')
+@app.post('/uploadfile/',response_model=UploadProfileResponse)
 async def upload_file(file:UploadFile=File(...)):
     valid_extensions = {'pdf', 'docx'}
     ext=file.filename.lower().rsplit('.', 1)[-1]
@@ -126,7 +142,7 @@ async def upload_file(file:UploadFile=File(...)):
     await file.seek(0)
 
     try:
-        result=mk.convert_stream(io.BytesIO(content),stream_info=StreamInfo(extension=f"{ext}"))
+        result=await run_in_threadpool(mk.convert_stream, io.BytesIO(content), stream_info=StreamInfo(extension=f"{ext}"))
         text=result.text_content
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{e}Error occurred while processing the file.")
@@ -140,7 +156,22 @@ async def upload_file(file:UploadFile=File(...)):
 
     chain=prompt | structured_llm
     profile= await chain.ainvoke({"resume_markdown":text})
-    return {
+
+    if not profile:
+        raise HTTPException(status_code=400, detail="No resume data found in the file.")
+
+    responsedata= {
         "filename": file.filename,
-        "profile": profile
+        "profile": profile.model_dump()
     }
+
+    
+
+    await collection.update_one({"profile.email": profile.email}, {"$set": responsedata}, upsert=True)
+    doc=await collection.find_one({"profile.email": profile.email}, {"_id": 1})
+    return UploadProfileResponse(
+        message="Resume profile uploaded and stored successfully.",
+        document_id=str(doc["_id"]),
+        filename=file.filename,
+    )
+    

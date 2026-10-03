@@ -6,3 +6,4 @@ markitdown[pdf,docx]
 langchain
 langgraph
 langchain-google-genai
+pymongo
