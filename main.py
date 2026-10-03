@@ -160,6 +160,9 @@ async def upload_file(file:UploadFile=File(...)):
     if not profile:
         raise HTTPException(status_code=400, detail="No resume data found in the file.")
 
+    if not profile.email:
+        raise HTTPException(status_code=400, detail="Email is required in the resume data for storage.")
+    
     responsedata= {
         "filename": file.filename,
         "profile": profile.model_dump()
