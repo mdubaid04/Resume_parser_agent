@@ -34,8 +34,15 @@ async def fetch_jobs(
     config: RunnableConfig,
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
-    """Fetch job listings matching the user's target roles from their resume profile.
-    Call retrive_user_resume_from_db first if the profile is not loaded yet."""
+    """Fetch job listings that match the user's target roles.
+
+    IMPORTANT: This tool depends on the output of retrive_user_resume_from_db.
+    Always call retrive_user_resume_from_db FIRST and wait for its result.
+    Only after the resume profile is loaded, call this tool in a SEPARATE,
+    LATER step. NEVER call both tools in the same step or in parallel.
+
+    Takes no arguments. Target roles are read automatically from the loaded profile.
+    Use this when the user asks for jobs, openings, or vacancies."""
 
     profile = state.get("profile") or {}
     roles = profile.get("target_roles") or []
@@ -96,8 +103,11 @@ class AgentState(TypedDict):
 
 @tool
 async def retrive_user_resume_from_db( config:RunnableConfig,tool_call_id:Annotated[str,InjectedToolCallId])->Command:
-   """"Get the current user's resume profile (skills, experience, education, etc.) from the database.
-       Use this tool when the user asks for job or anything that needs their resume."""
+   """Load the current user's resume profile (skills, experience, education,
+    target roles) from the database into the agent state.
+
+    Call this FIRST whenever the user's resume or jobs are needed.
+    Must complete before fetch_jobs is called. Takes no arguments."""
 
    conf=config["configurable"]["collection"]
    id=config["configurable"]["resume_id"]
@@ -128,7 +138,19 @@ tool_node=ToolNode(tools=tools)
 
 
 prompt=ChatPromptTemplate.from_messages([
-    ("system","You are a helpful assistant. Use tools when needed, otherwise answer the user's question directly."),
+    ("system",
+     "You are a helpful job-search assistant.\n\n"
+     "TOOL RULES:\n"
+     "- Call tools ONE AT A TIME. Never call two tools in the same step.\n"
+     "- To find jobs: first call retrive_user_resume_from_db and wait for its result. "
+     "Only in the NEXT step call fetch_jobs.\n"
+     "- If the resume was already fetched earlier in this conversation, "
+     "do not fetch it again. Call fetch_jobs directly.\n"
+     "- fetch_jobs and retrive_user_resume_from_db take no arguments.\n\n"
+     "After fetch_jobs returns, summarise the best matches briefly: "
+     "title, company, location, salary (if available) and the link.\n\n"
+     "For general questions (e.g. 'what is machine learning') answer directly "
+     "without calling any tool."),
     MessagesPlaceholder("messages")
   ])
 
