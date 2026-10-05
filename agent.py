@@ -9,29 +9,85 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate,MessagesPlaceholder
 from dotenv import load_dotenv
 from langchain_core.tools import tool,InjectedToolCallId
-import asyncio
+from langgraph.prebuilt import InjectedState
 from langchain_core.messages import HumanMessage,ToolMessage
 from pymongo import AsyncMongoClient
 from langchain_core.runnables import RunnableConfig
 from bson import ObjectId
 from bson.errors import InvalidId
 from langgraph.types import Command
-import json
+import json,httpx
+from langgraph.checkpoint.memory import MemorySaver
 
 
 load_dotenv()
 
 
-adzuna_url="https://api.adzuna.com/v1/api/jobs/in/search/1"
-adzuna_params={
-    "app_id": os.getenv("ADZUNA_ID"),
-    "app_key": os.getenv("ADZUNA_API_KEY"),
-    "what": "python developer",
-    "where":"bangalore",
-    "results_per_page": 5,
-    "content-type": "application/json",
-    "max_days_old": 7,
-}
+ADZUNA_URL = "https://api.adzuna.com/v1/api/jobs/in/search/1"
+ADZUNA_ID = os.getenv("ADZUNA_ID")
+ADZUNA_API_KEY = os.getenv("ADZUNA_API_KEY")
+
+
+@tool
+async def fetch_jobs(
+    state: Annotated[dict, InjectedState],
+    config: RunnableConfig,
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command:
+    """Fetch job listings matching the user's target roles from their resume profile.
+    Call retrive_user_resume_from_db first if the profile is not loaded yet."""
+
+    profile = state.get("profile") or {}
+    roles = profile.get("target_roles") or []
+    if isinstance(roles, str):          # agar string aa gayi to list bana do
+        roles = [roles]
+
+    if not roles:
+        return Command(update={"messages": [ToolMessage(
+            "Error: profile not loaded or has no target_roles. "
+            "Call retrive_user_resume_from_db first.",
+            tool_call_id=tool_call_id)]})
+
+    where = config["configurable"].get("location", "Noida")
+    all_jobs, seen = [], set()
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            for role in roles:
+                r = await client.get(ADZUNA_URL, params={
+                    "app_id": ADZUNA_ID,
+                    "app_key": ADZUNA_API_KEY,
+                    "what": role,
+                    "where": where,
+                    "results_per_page": 5,
+                    "max_days_old": 7,
+                })
+                r.raise_for_status()
+
+                for j in r.json().get("results", []):
+                    if j["id"] in seen:
+                        continue
+                    seen.add(j["id"])
+                    all_jobs.append({
+                        "role_searched": role,
+                        "title": j.get("title"),
+                        "company": (j.get("company") or {}).get("display_name"),
+                        "description": j.get("description"),
+                        "salary_min": j.get("salary_min"),
+                        "salary_max": j.get("salary_max"),
+                        "salary_is_predicted": j.get("salary_is_predicted"),
+                        "location": (j.get("location") or {}).get("display_name"),
+                        "url": j.get("redirect_url"),
+                    })
+        llm_view = [{**job, "description": (job["description"] or "")[:200]} for job in all_jobs]
+
+        return Command(update={
+            "jobs": all_jobs,
+            "messages": [ToolMessage(json.dumps(llm_view, default=str), tool_call_id=tool_call_id)],
+        })
+    except Exception as e:
+        return Command(update={"messages": [ToolMessage(
+            f"Error: {e!r}", tool_call_id=tool_call_id)]})
 
 class AgentState(TypedDict):
   messages: Annotated[list[BaseMessage],add_messages]
@@ -44,7 +100,7 @@ async def retrive_user_resume_from_db( config:RunnableConfig,tool_call_id:Annota
        Use this tool when the user asks for job or anything that needs their resume."""
 
    conf=config["configurable"]["collection"]
-   id=config["configurable"]["id"]
+   id=config["configurable"]["resume_id"]
    try:
     obj_id=ObjectId(id)
    except (InvalidId, TypeError ,KeyError):
@@ -66,8 +122,8 @@ async def retrive_user_resume_from_db( config:RunnableConfig,tool_call_id:Annota
 
 
 router_llm=ChatGoogleGenerativeAI(model="gemma-4-31b-it")
-tools=[retrive_user_resume_from_db]
-tool_binded_llm=router_llm.bind_tools(tools)
+tools=[retrive_user_resume_from_db,fetch_jobs]
+tool_binded_llm=router_llm.bind_tools(tools,parallel_tool_calls=False)
 tool_node=ToolNode(tools=tools)
 
 
@@ -100,7 +156,7 @@ workflow.add_edge("tool_node","router")
 
 
 
-agent=workflow.compile()
+agent=workflow.compile(checkpointer=MemorySaver())
 
 png_bytes=agent.get_graph().draw_mermaid_png()
 
