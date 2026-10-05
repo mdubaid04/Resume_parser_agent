@@ -9,24 +9,35 @@ import os
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from pymongo import AsyncMongoClient
-
+from pymongo.asynchronous.collection import AsyncCollection
+from pymongo.asynchronous.database import AsyncDatabase
+import requests
 load_dotenv()
 
 mk=MarkItDown()
+client: AsyncMongoClient
+db: AsyncDatabase
+collection: AsyncCollection
+
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await collection.create_index("profile.email", unique=True)
-    yield
+    global client,db,collection
+    client=AsyncMongoClient(os.getenv("MONGODB_URI"))
+    try:
+        db= client.get_database("resume")
+        collection= db.get_collection("profiles")
+        await collection.create_index("profile.email",unique=True)
+        yield
+    finally:
+        await client.close()
 
 
 app=FastAPI(lifespan=lifespan, title="Resume Parser API", description="An API to parse resumes and extract structured data.", version="1.0.0")
 
-mongoo_url=os.getenv("MONGODB_URI")
 
-client = AsyncMongoClient(mongoo_url)
-db = client["resume"]
-collection = db["profiles"]
+
 
 class Experience(BaseModel):
     company: str|None = Field(None,description="Name of the company" , json_schema_extra={"example": "ABC Corp"})
@@ -157,9 +168,6 @@ async def upload_file(file:UploadFile=File(...)):
     chain=prompt | structured_llm
     profile= await chain.ainvoke({"resume_markdown":text})
 
-    if not profile:
-        raise HTTPException(status_code=400, detail="No resume data found in the file.")
-
     if not profile.email:
         raise HTTPException(status_code=400, detail="Email is required in the resume data for storage.")
     
@@ -178,3 +186,15 @@ async def upload_file(file:UploadFile=File(...)):
         filename=file.filename,
     )
     
+
+
+# @app.get('/test_api/')
+# async def test_api():
+#     resp=requests.get(adzuna_url, params=adzuna_params,timeout=10)
+#     if resp.status_code != 200:
+#         raise HTTPException(status_code=resp.status_code, detail=resp.text)
+#     jobs=resp.json()
+#     if not jobs:
+#         raise HTTPException(status_code=404, detail="No jobs found.")
+
+#     return {"message": "API is working fine.", "jobs": jobs}
